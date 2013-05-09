@@ -15,7 +15,8 @@ from django.utils.tree import Node
 
 from pymongo.errors import PyMongoError, DuplicateKeyError
 from pymongo import ASCENDING, DESCENDING
-from bson.objectid import ObjectId, InvalidId
+from bson.objectid import ObjectId
+from bson.errors import InvalidId
 
 from djangotoolbox.db.basecompiler import NonrelQuery, NonrelCompiler, \
     NonrelInsertCompiler, NonrelUpdateCompiler, NonrelDeleteCompiler
@@ -144,6 +145,7 @@ class MongoQuery(NonrelQuery):
             query = self._mongo_query
 
         if filters.connector == OR:
+            assert '$or' not in query, "Multiple ORs are not supported"
             or_conditions = query['$or'] = []
 
         if filters.negated:
@@ -161,7 +163,7 @@ class MongoQuery(NonrelQuery):
                         raise DatabaseError("Nested ORs are not supported")
 
                 if filters.connector == OR and filters.negated:
-                    raise NotImplementedError("Negated ORs are not implemented")
+                    raise NotImplementedError("Negated ORs are not supported")
 
                 self.add_filters(child, query=subquery)
 
@@ -249,9 +251,12 @@ class MongoQuery(NonrelQuery):
                             else:
                                 existing.update(lookup)
                         else:
-                            # {'$gt': o1} + {'$lt': o2} --> {'$gt': o1, '$lt': o2}
-                            assert all(key not in existing for key in lookup.keys()), [lookup, existing]
-                            existing.update(lookup)
+                            if '$in' in lookup and '$in' in existing:
+                                existing['$in'] = list(set(lookup['$in'] + existing['$in']))
+                            else:
+                                # {'$gt': o1} + {'$lt': o2} --> {'$gt': o1, '$lt': o2}
+                                assert all(key not in existing for key in lookup.keys()), [lookup, existing]
+                                existing.update(lookup)
                     else:
                         key = '$nin' if self._negated else '$all'
                         existing.setdefault(key, []).append(lookup)
@@ -401,6 +406,7 @@ class SQLCompiler(NonrelCompiler):
             ret.append(result)
         return ret
 
+
 class SQLInsertCompiler(NonrelInsertCompiler, SQLCompiler):
     @safe_call
     def insert(self, docs, return_id=False):
@@ -421,13 +427,46 @@ class SQLInsertCompiler(NonrelInsertCompiler, SQLCompiler):
         if return_id:
             return unicode(pks)
 
+
 # TODO: Define a common nonrel API for updates and add it to the nonrel
 # backend base classes and port this code to that API
 class SQLUpdateCompiler(NonrelUpdateCompiler, SQLCompiler):
     query_class = MongoQuery
 
+    def update(self, values):
+        multi = True
+        spec = {}
+        for field, value in values:
+            if field.primary_key:
+                raise DatabaseError("Can not modify _id")
+            if getattr(field, 'forbids_updates', False):
+                raise DatabaseError("Updates on %ss are not allowed" %
+                                    field.__class__.__name__)
+            if hasattr(value, 'evaluate'):
+                # .update(foo=F('foo') + 42) --> {'$inc': {'foo': 42}}
+                lhs, rhs = value.children
+                assert value.connector in (value.ADD, value.SUB) \
+                   and not value.negated \
+                   and not value.subtree_parents \
+                   and isinstance(lhs, F) \
+                   and not isinstance(rhs, F) \
+                   and lhs.name == field.name
+                if value.connector == value.SUB:
+                    rhs = -rhs
+                action = '$inc'
+                value = rhs
+            else:
+                # .update(foo=123) --> {'$set': {'foo': 123}}
+                action = '$set'
+            spec.setdefault(action, {})[field.column] = value
+
+            if field.unique:
+                multi = False
+
+        return self.execute_update(spec, multi)
+
     @safe_call
-    def execute_raw(self, update_spec, multi=True, **kwargs):
+    def execute_update(self, update_spec, multi=True, **kwargs):
         collection = self.get_collection()
         criteria = self.build_query()._mongo_query
         options = self.connection.operation_flags.get('update', {})
@@ -436,45 +475,6 @@ class SQLUpdateCompiler(NonrelUpdateCompiler, SQLCompiler):
         if info is not None:
             return info.get('n')
 
-    def execute_sql(self, result_type):
-        return self.execute_raw(*self._get_update_spec())
-
-    def _get_update_spec(self):
-        multi = True
-        spec = {}
-        for field, _, value in self.query.values:
-            if getattr(field, 'forbids_updates', False):
-                raise DatabaseError("Updates on %ss are not allowed" %
-                                    field.__class__.__name__)
-            if field.unique:
-                multi = False
-            if hasattr(value, 'prepare_database_save'):
-                value = value.prepare_database_save(field)
-            else:
-                value = field.get_db_prep_save(value, connection=self.connection)
-
-            value = self.convert_value_for_db(field.db_type(connection=self.connection), value)
-            if hasattr(value, "evaluate"):
-                assert value.connector in (value.ADD, value.SUB)
-                assert not value.negated
-                assert not value.subtree_parents
-                lhs, rhs = value.children
-                if isinstance(lhs, F):
-                    assert not isinstance(rhs, F)
-                    assert lhs.name == field.name
-                    if value.connector == value.SUB:
-                        rhs = -rhs
-                else:
-                    assert value.connector == value.ADD
-                    rhs, lhs = lhs, rhs
-                action, column, value = '$inc', lhs.name, rhs
-            else:
-                action, column, value = '$set', field.column, value
-            if column == get_pk_column(self):
-                raise DatabaseError("Can not modify _id")
-            spec.setdefault(action, {})[column] = value
-
-        return spec, multi
 
 class SQLDeleteCompiler(NonrelDeleteCompiler, SQLCompiler):
     pass

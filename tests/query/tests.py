@@ -4,7 +4,11 @@ from operator import attrgetter
 from django.db.models import F, Q
 from django.db.utils import DatabaseError
 
-from pymongo.objectid import ObjectId
+# handle pymongo backward compatibility
+try:
+    from bson.objectid import ObjectId
+except ImportError:
+    from pymongo.objectid import ObjectId
 
 from .models import *
 from .utils import *
@@ -234,6 +238,13 @@ class BasicQueryTests(TestCase):
             []
         )
 
+        # Tests chaining on primary keys
+        blog_id = Blog.objects.get().id
+        self.assertEqual(
+            Blog.objects.filter(pk = blog_id).filter(pk = blog_id).get(),
+            Blog.objects.get()
+        )
+
     def test_negated_Q(self):
         blogs = [Blog.objects.create(title=title) for title in
                  ('blog', 'other blog', 'another blog')]
@@ -374,6 +385,17 @@ class UpdateTests(TestCase):
         self.assertEqual(Person.objects.get(id=andy.pk).age, 2)
         Person.objects.filter(name='john').update(age=F('age')-10)
         self.assertEqual(Person.objects.get(name='john').age, 39)
+
+    def test_update_with_F_and_db_column(self):
+        # This test is simmilar to test_update_with_F but tests
+        # the update with a column that has a db_column set.
+        john = Person.objects.create(name='john', surname='nhoj', another_age=42)
+        andy = Person.objects.create(name='andy', surname='ydna', another_age=-5)
+        Person.objects.update(another_age=F('another_age')+7)
+        self.assertEqual(Person.objects.get(pk=john.id).another_age, 49)
+        self.assertEqual(Person.objects.get(id=andy.pk).another_age, 2)
+        Person.objects.filter(name='john').update(another_age=F('another_age')-10)
+        self.assertEqual(Person.objects.get(name='john').another_age, 39)
 
     def test_invalid_update_with_F(self):
         self.assertRaises(AssertionError, Person.objects.update, age=F('name')+1)
