@@ -15,7 +15,7 @@ from django.utils.tree import Node
 
 from pymongo.errors import PyMongoError, DuplicateKeyError
 from pymongo import ASCENDING, DESCENDING
-from pymongo.objectid import ObjectId, InvalidId
+from bson.objectid import ObjectId, InvalidId
 
 from djangotoolbox.db.basecompiler import NonrelQuery, NonrelCompiler, \
     NonrelInsertCompiler, NonrelUpdateCompiler, NonrelDeleteCompiler
@@ -90,6 +90,12 @@ class MongoQuery(NonrelQuery):
             entity[get_pk_column(self)] = entity.pop('_id')
             yield entity
 
+    def convert_value_from_db(self, db_type, value):
+        return self.compiler.convert_value_from_db(db_type, value)
+
+    def convert_value_for_db(self, db_type, value):
+        return self.compiler.convert_value_for_db(db_type, value)
+
     @safe_call
     def count(self, limit=None):
         results = self._get_results()
@@ -99,14 +105,16 @@ class MongoQuery(NonrelQuery):
 
     @safe_call
     def order_by(self, ordering):
-        for order in ordering:
-            if order.startswith('-'):
-                order, direction = order[1:], DESCENDING
-            else:
-                direction = ASCENDING
-            if order == get_pk_column(self):
-                order = '_id'
-            self._ordering.append((order, direction))
+        if ordering == False:
+            self._ordering = [('$natural', -1)]
+        elif ordering == True:
+            pass # self._ordering = [('$natural', 1)] -- default behavior
+        elif type(ordering) == list:
+            for key, value in ordering:
+                if value: direction = 1
+                if not value: direction = -1
+                self._ordering.append((key.column, direction))
+
         return self
 
     @safe_call
@@ -164,6 +172,9 @@ class MongoQuery(NonrelQuery):
                 continue
 
             column, lookup_type, db_type, value = self._decode_child(child)
+            column = column.column
+
+            print db_type, lookup_type
 
             if lookup_type in ('month', 'day'):
                 raise DatabaseError("MongoDB does not support month/day queries")
